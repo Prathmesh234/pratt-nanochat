@@ -13,10 +13,11 @@ from dataclasses import dataclass
 
 import torch 
 import torch.nn as nn 
-import torch.nn.functional as F 
-from nanochat-pratt.common import get_dist_info, print0 
-from nanochat-pratt.muon import Muon, DistMuon 
-from nanochat-pratt.adamw import DistAdamW
+import torch.nn.functional as F
+from torch.optim.adamw import AdamW 
+from common import get_dist_info, print0 
+from muon import Muon, DistMuon 
+from adamw import DistAdamW
 
 
 @dataclass 
@@ -215,7 +216,97 @@ class GPT(nn.Module):
         lm_head_params= list(self.lm_head.parameters())
 
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params)
-        
+
+        ##creating the adamw optimizer for the embedding and the lm_head 
+        dmodel_lr_scale = (model_dim/768) ** -0.5
+        if rank == 0:
+            print(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
+        adam_groups = [
+            dict(params=lm_head_params, lr=unembedding_lr*dmodel_lr_scale),
+            dict(params=embedding_params, lr=embedding_lr*dmodel_lr_scale)
+        ]
+        adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+
+        ##muon optimizer 
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        MuonFactory = DistMuon if ddp else Muon
+        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        ##combine the two optmizers into one list 
+        optimizers =[adamw_optimizer, muon_optimizer]
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+        return optimizers
+    
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+        B, T = idx.size()
+
+        assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == torch.bfloat16, "Rotary embeddings must be in bfloat16"
+
+        #if kv cache exists, we need to offset the rotary embeddings to the current position in the cache 
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+        #Forward the trunk of the transformer 
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        for block in self.transformer.h:
+            x  = block(x, cos_sin, kv_cache)
+        x = norm(x)
+
+
+        ##forward to the lm head to compute the logits 
+        softcap = 15
+        if targets is not None:
+            ##this is the training mode so we have to calculate the loss 
+            logits  =  self.lm_head(x)
+            logits = softcap * torch.tanh(logits/softcap) ## softcap on logits 
+            logits  = logits.float() #use tf32/fp32 for logits 
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            return loss 
+        else:
+            #inference mode - to compute and return the logits 
+            logits = self.lm_head(x)
+            logits = softcap * torch.tanh(logits / softcap)
+            return logits 
+    @torch.inference_mode()
+    def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
+
+        '''
+        naive autoregressive streaming inference 
+        '''
+        assert isinstance(tokens, list)
+        device = self.get_device()
+        rng = None 
+        if temperature > 0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        for _ in range(max_tokens):
+            logits = self.forward(ids)
+            logits = logits[:, -1, :] #[B, vocab_size]
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            if temperature > 0:
+                logits  = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+            else:
+                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+            ids = torch.cat((ids, next_ids), dim=1)
+            token = next_ids.item()
+            yield token
+
+
+
+
+
+
 
 
 
